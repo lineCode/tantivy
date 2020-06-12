@@ -23,8 +23,8 @@ fn shallow_advance(scorers: &mut Vec<TermScorer>, pivot: DocId) -> Score {
         if scorer.doc() > pivot {
             break;
         }
-        scorer.postings.block_cursor.seek(pivot);
-        block_max_score_upperbound += scorer.postings.block_cursor.skip_reader.block_max_score();
+        scorer.postings.block_cursor.shallow_seek(pivot);
+        block_max_score_upperbound += scorer.block_max_score();
     }
     block_max_score_upperbound
 }
@@ -69,6 +69,10 @@ pub fn block_wand(
         let pivot_opt = find_pivot_doc(&scorers, threshold);
         if let Some(pivot_doc) = pivot_opt {
             let block_max_score_upperbound = shallow_advance(&mut scorers, pivot_doc);
+            // Beware after shallow advance, skip readers can be in advance compared to
+            // the segment posting lists.
+            //
+            // `block_segment_postings.load_block()` need to be called separately.
             // TODO bug: more than one scorer can point on the pivot.
             if block_max_score_upperbound <= threshold {
                 // TODO choose a better candidate.

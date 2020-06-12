@@ -8,9 +8,9 @@ use crate::fastfield::DeleteBitSet;
 use crate::fastfield::FastFieldReader;
 use crate::fastfield::FastFieldSerializer;
 use crate::fastfield::MultiValueIntFastFieldReader;
-use crate::fieldnorm::{FieldNormReader, FieldNormReaders};
 use crate::fieldnorm::FieldNormsSerializer;
 use crate::fieldnorm::FieldNormsWriter;
+use crate::fieldnorm::{FieldNormReader, FieldNormReaders};
 use crate::indexer::SegmentSerializer;
 use crate::postings::InvertedIndexSerializer;
 use crate::postings::Postings;
@@ -181,9 +181,9 @@ impl IndexMerger {
                 }
             }
             fieldnorms_serializer.serialize_field(field, &fieldnorms_data[..])?;
-       }
-       fieldnorms_serializer.close()?;
-       Ok(())
+        }
+        fieldnorms_serializer.close()?;
+        Ok(())
     }
 
     fn write_fast_fields(
@@ -493,7 +493,7 @@ impl IndexMerger {
         indexed_field: Field,
         field_type: &FieldType,
         serializer: &mut InvertedIndexSerializer,
-        fieldnorm_reader: Option<FieldNormReader>
+        fieldnorm_reader: Option<FieldNormReader>,
     ) -> crate::Result<Option<TermOrdinalMapping>> {
         let mut positions_buffer: Vec<u32> = Vec::with_capacity(1_000);
         let mut delta_computer = DeltaComputer::new();
@@ -552,7 +552,8 @@ impl IndexMerger {
         // - Segment 2's doc ids become  [seg0.max_doc + seg1.max_doc,
         //                                seg0.max_doc + seg1.max_doc + seg2.max_doc]
         // ...
-        let mut field_serializer = serializer.new_field(indexed_field, total_num_tokens, fieldnorm_reader)?;
+        let mut field_serializer =
+            serializer.new_field(indexed_field, total_num_tokens, fieldnorm_reader)?;
 
         let field_entry = self.schema.get_field_entry(indexed_field);
 
@@ -596,7 +597,11 @@ impl IndexMerger {
 
                 // We know that there is at least one document containing
                 // the term, so we add it.
-                let to_term_ord = field_serializer.new_term(term_bytes)?;
+                let term_doc_freq = segment_postings
+                    .iter()
+                    .map(|(_, segment_posting)| segment_posting.doc_freq())
+                    .sum();
+                let to_term_ord = field_serializer.new_term(term_bytes, term_doc_freq)?;
 
                 if let Some(ref mut term_ord_mapping) = term_ord_mapping_opt {
                     for (segment_ord, from_term_ord) in merged_terms.matching_segments() {
@@ -617,8 +622,7 @@ impl IndexMerger {
                             // there is at least one document.
                             let term_freq = segment_postings.term_freq();
                             segment_postings.positions(&mut positions_buffer);
-                            let delta_positions =
-                                delta_computer.compute_delta(&positions_buffer);
+                            let delta_positions = delta_computer.compute_delta(&positions_buffer);
                             field_serializer.write_doc(
                                 remapped_doc_id,
                                 term_freq,
@@ -641,15 +645,18 @@ impl IndexMerger {
     fn write_postings(
         &self,
         serializer: &mut InvertedIndexSerializer,
-        fieldnorm_readers: FieldNormReaders
+        fieldnorm_readers: FieldNormReaders,
     ) -> crate::Result<HashMap<Field, TermOrdinalMapping>> {
         let mut term_ordinal_mappings = HashMap::new();
         for (field, field_entry) in self.schema.fields() {
             let fieldnorm_reader = fieldnorm_readers.get_field(field);
             if field_entry.is_indexed() {
-                if let Some(term_ordinal_mapping) =
-                    self.write_postings_for_field(field, field_entry.field_type(), serializer, fieldnorm_reader)?
-                {
+                if let Some(term_ordinal_mapping) = self.write_postings_for_field(
+                    field,
+                    field_entry.field_type(),
+                    serializer,
+                    fieldnorm_reader,
+                )? {
                     term_ordinal_mappings.insert(field, term_ordinal_mapping);
                 }
             }
@@ -678,9 +685,12 @@ impl SerializableSegment for IndexMerger {
         if let Some(fieldnorms_serializer) = serializer.get_fieldnorms_serializer() {
             self.write_fieldnorms(fieldnorms_serializer)?;
         }
-        let fieldnorm_data = serializer.segment().open_read(SegmentComponent::FIELDNORMS)?;
+        let fieldnorm_data = serializer
+            .segment()
+            .open_read(SegmentComponent::FIELDNORMS)?;
         let fieldnorm_readers = FieldNormReaders::new(fieldnorm_data)?;
-        let term_ord_mappings = self.write_postings(serializer.get_postings_serializer(), fieldnorm_readers)?;
+        let term_ord_mappings =
+            self.write_postings(serializer.get_postings_serializer(), fieldnorm_readers)?;
         self.write_fast_fields(serializer.get_fast_field_serializer(), term_ord_mappings)?;
         self.write_storable_fields(serializer.get_store_writer())?;
         serializer.close()?;

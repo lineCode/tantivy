@@ -1,11 +1,21 @@
 use crate::common::{BinarySerializable, VInt};
 use crate::directory::ReadOnlySource;
+use crate::fieldnorm::FieldNormReader;
 use crate::postings::compression::{
     AlignedBuffer, BlockDecoder, VIntDecoder, COMPRESSION_BLOCK_SIZE,
 };
 use crate::postings::{BlockInfo, FreqReadingOption, SkipReader};
+use crate::query::BM25Weight;
 use crate::schema::IndexRecordOption;
-use crate::{DocId, TERMINATED};
+use crate::{DocId, Score, TERMINATED};
+
+fn max_f32<I: Iterator<Item = f32>>(mut it: I) -> Option<f32> {
+    if let Some(first) = it.next() {
+        Some(it.fold(first, f32::max))
+    } else {
+        None
+    }
+}
 
 /// `BlockSegmentPostings` is a cursor iterating over blocks
 /// of documents.
@@ -19,6 +29,7 @@ pub struct BlockSegmentPostings {
     loaded_offset: usize,
     freq_decoder: BlockDecoder,
     freq_reading_option: FreqReadingOption,
+    block_max_score_cache: Option<Score>,
 
     doc_freq: u32,
 
@@ -94,12 +105,45 @@ impl BlockSegmentPostings {
             loaded_offset: std::usize::MAX,
             freq_decoder: BlockDecoder::with_val(1),
             freq_reading_option,
+            block_max_score_cache: None,
             doc_freq,
             data: postings_data,
             skip_reader,
         };
         block_segment_postings.advance();
         block_segment_postings
+    }
+
+    pub fn block_max_score(
+        &mut self,
+        fieldnorm_reader: &FieldNormReader,
+        bm25_weight: &BM25Weight,
+    ) -> Score {
+        let (block_max_score_cache, skip_reader, doc_decoder, freq_decoder) = (
+            &mut self.block_max_score_cache,
+            &self.skip_reader,
+            &self.doc_decoder,
+            &self.freq_decoder,
+        );
+        *block_max_score_cache.get_or_insert_with(|| {
+            skip_reader
+                .block_max_score(bm25_weight)
+                .or_else(|| {
+                    let docs = doc_decoder.output_array();
+                    let freqs = freq_decoder.output_array();
+                    max_f32(docs.iter().cloned().zip(freqs.iter().cloned()).map(
+                        |(doc, term_freq)| {
+                            let fieldnorm_id = fieldnorm_reader.fieldnorm_id(doc);
+                            bm25_weight.score(fieldnorm_id, term_freq)
+                        },
+                    ))
+                })
+                .unwrap_or(0f32)
+        })
+    }
+
+    pub(crate) fn freq_reading_option(&self) -> FreqReadingOption {
+        self.freq_reading_option
     }
 
     // Resets the block segment postings on another position
@@ -125,7 +169,8 @@ impl BlockSegmentPostings {
         self.doc_freq = doc_freq;
     }
 
-    /// Returns the document frequency associated to this block postings.
+    /// Returns the overall number of documents in the block postings.
+    /// It does not take in account whether documents are deleted or not.
     ///
     /// This `doc_freq` is simply the sum of the length of all of the blocks
     /// length, and it does not take in account deleted documents.
@@ -139,29 +184,41 @@ impl BlockSegmentPostings {
     /// returned by `.docs()` is empty.
     #[inline]
     pub fn docs(&self) -> &[DocId] {
+        debug_assert!(self.block_is_loaded());
         self.doc_decoder.output_array()
     }
 
+    /// Returns a full block, regardless of whetehr the block is complete or incomplete (
+    /// as it happens for the last block of the posting list).
+    ///
+    /// In the latter case, the block is guaranteed to be padded with the sentinel value:
+    /// `TERMINATED`. The array is also guaranteed to be aligned on 16 bytes = 128 bits.
+    ///
+    /// This method is useful to run SSE2 linear search.
     #[inline(always)]
     pub(crate) fn docs_aligned(&self) -> &AlignedBuffer {
+        debug_assert!(self.block_is_loaded());
         self.doc_decoder.output_aligned()
     }
 
     /// Return the document at index `idx` of the block.
     #[inline(always)]
     pub fn doc(&self, idx: usize) -> u32 {
+        debug_assert!(self.block_is_loaded());
         self.doc_decoder.output(idx)
     }
 
     /// Return the array of `term freq` in the block.
     #[inline]
     pub fn freqs(&self) -> &[u32] {
+        debug_assert!(self.block_is_loaded());
         self.freq_decoder.output_array()
     }
 
     /// Return the frequency at index `idx` of the block.
     #[inline]
     pub fn freq(&self, idx: usize) -> u32 {
+        debug_assert!(self.block_is_loaded());
         self.freq_decoder.output(idx)
     }
 
@@ -172,6 +229,7 @@ impl BlockSegmentPostings {
     /// of any number between 1 and `NUM_DOCS_PER_BLOCK - 1`
     #[inline]
     pub fn block_len(&self) -> usize {
+        debug_assert!(self.block_is_loaded());
         self.doc_decoder.output_len
     }
 
@@ -184,8 +242,20 @@ impl BlockSegmentPostings {
     /// If all docs are smaller than target, the block loaded may be empty,
     /// or be the last an incomplete VInt block.
     pub fn seek(&mut self, target_doc: DocId) {
-        self.skip_reader.seek(target_doc);
+        self.shallow_seek(target_doc);
         self.load_block();
+    }
+
+    /// Dangerous API! This calls seek on the skip list,
+    /// but does not `.load_block()` afterwards.
+    ///
+    /// `.load_block()` needs to be called manually afterwards.
+    pub(crate) fn shallow_seek(&mut self, target_doc: DocId) {
+        self.skip_reader.seek(target_doc);
+    }
+
+    fn block_is_loaded(&self) -> bool {
+        self.loaded_offset == self.skip_reader.byte_offset()
     }
 
     fn load_block(&mut self) {
@@ -213,7 +283,7 @@ impl BlockSegmentPostings {
                     tf_num_bits,
                 );
             }
-            BlockInfo::VInt(num_vint_docs) => {
+            BlockInfo::VInt { num_docs, .. } => {
                 decode_vint_block(
                     &mut self.doc_decoder,
                     if let FreqReadingOption::ReadFreq = self.freq_reading_option {
@@ -223,7 +293,7 @@ impl BlockSegmentPostings {
                     },
                     &self.data.as_slice()[offset..],
                     self.skip_reader.last_doc_in_previous_block,
-                    num_vint_docs as usize,
+                    num_docs as usize,
                 );
             }
         }
@@ -234,6 +304,8 @@ impl BlockSegmentPostings {
     /// Returns false iff there was no remaining blocks.
     pub fn advance(&mut self) -> bool {
         if !self.skip_reader.advance() {
+            self.doc_decoder.clear();
+            self.freq_decoder.clear();
             return false;
         }
         self.load_block();
@@ -244,9 +316,10 @@ impl BlockSegmentPostings {
     pub fn empty() -> BlockSegmentPostings {
         BlockSegmentPostings {
             doc_decoder: BlockDecoder::with_val(TERMINATED),
-            loaded_offset: std::usize::MAX,
+            loaded_offset: 0,
             freq_decoder: BlockDecoder::with_val(1),
             freq_reading_option: FreqReadingOption::NoFreq,
+            block_max_score_cache: None,
             doc_freq: 0,
             data: ReadOnlySource::new(vec![]),
             skip_reader: SkipReader::new(ReadOnlySource::new(vec![]), 0, IndexRecordOption::Basic),
@@ -272,8 +345,10 @@ mod tests {
     #[test]
     fn test_empty_segment_postings() {
         let mut postings = SegmentPostings::empty();
+        assert_eq!(postings.doc(), TERMINATED);
         assert_eq!(postings.advance(), TERMINATED);
         assert_eq!(postings.advance(), TERMINATED);
+        assert_eq!(postings.doc_freq(), 0);
         assert_eq!(postings.len(), 0);
     }
 
